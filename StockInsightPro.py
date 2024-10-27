@@ -13,6 +13,17 @@ from sklearn.ensemble import RandomForestRegressor
 import ta
 from GoogleNews import GoogleNews
 from textblob import TextBlob
+from prophet import Prophet
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, Dict, Tuple
+import logging
+
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Helper functions
 def search_indian_stocks(query):
@@ -62,7 +73,7 @@ def get_realtime_data(symbol):
             'targetEstimate': info.get('targetMeanPrice', 'N/A'),
         }
     except Exception as e:
-        st.error(f"Error fetching data for {symbol}: {str(e)}")
+        logging.error(f"Error fetching data for {symbol}: {str(e)}")
         return None
 
 @st.cache_data(ttl=3600)
@@ -72,7 +83,7 @@ def get_stock_data(symbol, start_date, end_date):
         data = stock.history(start=start_date, end=end_date)
         return data
     except Exception as e:
-        st.error(f"Error fetching historical data for {symbol}: {str(e)}")
+        logging.error(f"Error fetching historical data for {symbol}: {str(e)}")
         return pd.DataFrame()
 
 def calculate_technical_indicators(data):
@@ -157,6 +168,19 @@ def random_forest_prediction(data, future_days=30):
     predictions = model.predict(X[-future_days:])
     return predictions
 
+def prophet_prediction(data, future_days=30):
+    df = data[['Close']].reset_index()
+    df.columns = ['ds', 'y']
+    
+    # Remove timezone from the 'ds' column
+    df['ds'] = df['ds'].dt.tz_localize(None)
+    
+    model = Prophet()
+    model.fit(df)
+    future = model.make_future_dataframe(periods=future_days)
+    forecast = model.predict(future)
+    return forecast[['ds', 'yhat']].tail(future_days)
+
 def plot_stock_analysis(data, stock_symbol, indicators):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
                         subplot_titles=('Stock Price with Indicators', 'Volume'),
@@ -202,6 +226,7 @@ def plot_advanced_analysis(data, stock_symbol, indicators):
     lstm_pred = lstm_prediction(data)
     arima_pred = arima_prediction(data)
     rf_pred = random_forest_prediction(data)
+    prophet_pred = prophet_prediction(data)
     
     # Add predictions to the first subplot
     if lstm_pred is not None:
@@ -213,6 +238,9 @@ def plot_advanced_analysis(data, stock_symbol, indicators):
     if rf_pred is not None:
         fig.add_trace(go.Scatter(x=pd.date_range(start=data.index[-1], periods=31)[1:], y=rf_pred, name='Random Forest Prediction', line=dict(color='blue')), row=1, col=1)
     
+    if prophet_pred is not None:
+        fig.add_trace(go.Scatter(x=prophet_pred['ds'], y=prophet_pred['yhat'], name='Prophet Prediction', line=dict(color='purple')), row=1, col=1)
+    
     fig.update_layout(
         height=1000,
         template="plotly_white",
@@ -223,14 +251,19 @@ def plot_advanced_analysis(data, stock_symbol, indicators):
     )
     return fig
 
+@st.cache_data(ttl=300)
 def get_stock_news(stock_symbol, num_articles=5):
-    googlenews = GoogleNews(lang='en', region='IN')
-    googlenews.search(stock_symbol)
-    result = googlenews.result()
-    df = pd.DataFrame(result)
-    if not df.empty:
-        df = df[['title', 'desc', 'date', 'link']].head(num_articles)
-    return df
+    try:
+        googlenews = GoogleNews(lang='en', region='IN')
+        googlenews.search(stock_symbol)
+        result = googlenews.result()
+        df = pd.DataFrame(result)
+        if not df.empty:
+            df = df[['title', 'desc', 'date', 'link']].head(num_articles)
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching news for {stock_symbol}: {str(e)}")
+        return pd.DataFrame()
 
 def analyze_sentiment(text):
     blob = TextBlob(text)
@@ -330,73 +363,306 @@ def display_metric(label, value, delta=None):
     </div>
     """, unsafe_allow_html=True)
 
-def plot_portfolio_composition(portfolio_data):
-    fig = go.Figure()
-    for symbol, data in portfolio_data.items():
-        fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name=symbol))
-    
-    fig.update_layout(
-        title="Portfolio Composition",
-        xaxis_title="Date",
-        yaxis_title="Price",
-        legend_title="Symbols",
-        template="plotly_white"
-    )
-    return fig
+@dataclass
+class StockMetrics:
+    """Data class to hold stock metrics with improved validation and default handling."""
+    bid: float
+    ask: float
+    day_range: Tuple[float, float]
+    week_range: Tuple[float, float]
+    avg_volume: int
+    beta: float
+    market_cap: float
+    pe_ratio: Optional[float]
+    eps: Optional[float]
+    forward_pe: Optional[float]
+    earnings_date: Optional[datetime]
+    dividend_yield: Optional[float]
+    ex_dividend_date: Optional[datetime]
+    target_est: Optional[float]
 
-def plot_portfolio_performance(total_return, annualized_return, volatility, total_return_value, total_initial_value, total_current_value):
-    fig = go.Figure(data=[
-        go.Bar(name='Total Return', x=['Total Return'], y=[total_return.mean()]),
-        go.Bar(name='Annualized Return', x=['Annualized Return'], y=[annualized_return.mean()]),
-        go.Bar(name='Volatility', x=['Volatility'], y=[volatility.mean()]),
-        go.Bar(name='Total Return Value', x=['Total Return Value'], y=[total_return_value]),
-        go.Bar(name='Total Initial Value', x=['Total Initial Value'], y=[total_initial_value]),
-        go.Bar(name='Total Current Value', x=['Total Current Value'], y=[total_current_value])
-    ])
-    fig.update_layout(
-        title="Portfolio Performance",
-        xaxis_title="Metrics",
-        yaxis_title="Values",
-        barmode='group',
-        template="plotly_white"
-    )
-    return fig
+    def __post_init__(self):
+        """Validate inputs and convert types with fallback values."""
+        try:
+            # Helper function to safely convert numeric values
+            def safe_convert(value, converter, default):
+                if isinstance(value, (int, float)):
+                    return converter(value)
+                try:
+                    if isinstance(value, str):
+                        # Remove commas and convert
+                        cleaned = value.replace(',', '')
+                        if cleaned != 'N/A':
+                            return converter(cleaned)
+                except (ValueError, TypeError):
+                    pass
+                return default
 
-def get_portfolio_data(portfolio, start_date, end_date):
-    portfolio_data = {}
-    for symbol in portfolio:
-        data = get_stock_data(symbol, start_date, end_date)
-        if not data.empty:
-            portfolio_data[symbol] = data
-    return portfolio_data
+            # Convert numerical fields with appropriate defaults
+            self.bid = safe_convert(self.bid, float, 0.0)
+            self.ask = safe_convert(self.ask, float, 0.0)
+            self.beta = safe_convert(self.beta, float, 1.0)  # Default beta of 1
+            self.market_cap = safe_convert(self.market_cap, float, 0.0)
+            self.avg_volume = safe_convert(self.avg_volume, int, 0)
+            
+            # Handle optional fields
+            self.pe_ratio = safe_convert(self.pe_ratio, float, None)
+            self.eps = safe_convert(self.eps, float, None)
+            self.forward_pe = safe_convert(self.forward_pe, float, None)
+            self.dividend_yield = safe_convert(self.dividend_yield, float, None)
+            self.target_est = safe_convert(self.target_est, float, None)
 
-def calculate_portfolio_performance(portfolio_data, portfolio_info):
-    portfolio_returns = {}
-    portfolio_values = {}
-    
-    for symbol, data in portfolio_data.items():
-        data['Return'] = data['Close'].pct_change()
-        portfolio_returns[symbol] = data['Return']
+            # Special handling for day_range and week_range
+            def parse_range(range_value, default=(0.0, 0.0)):
+                if isinstance(range_value, tuple) and len(range_value) == 2:
+                    low = safe_convert(range_value[0], float, 0.0)
+                    high = safe_convert(range_value[1], float, 0.0)
+                    return (low, high)
+                return default
+
+            self.day_range = parse_range(self.day_range)
+            self.week_range = parse_range(self.week_range)
+
+            # Handle datetime fields
+            def safe_convert_datetime(value):
+                if isinstance(value, datetime):
+                    return value
+                if isinstance(value, (int, float)):
+                    try:
+                        return datetime.fromtimestamp(int(value))
+                    except (ValueError, OSError):
+                        return None
+                return None
+
+            self.earnings_date = safe_convert_datetime(self.earnings_date)
+            self.ex_dividend_date = safe_convert_datetime(self.ex_dividend_date)
+
+        except Exception as e:
+            raise ValueError(f"Error validating metrics: {str(e)}")
+
+    def is_valid_for_analysis(self) -> bool:
+        """
+        Check if the metrics contain enough valid data for meaningful analysis.
+        Returns True if essential metrics are available.
+        """
+        # Check if we have either bid/ask prices or market cap
+        has_price_data = (self.bid > 0 and self.ask > 0) or self.market_cap > 0
+        # Check if we have any trading activity data
+        has_trading_data = self.avg_volume > 0 or (self.day_range[1] > self.day_range[0])
         
-        avg_price = portfolio_info[symbol]['avg_price']
-        num_shares = portfolio_info[symbol]['num_shares']
-        initial_value = avg_price * num_shares
-        current_value = data['Close'][-1] * num_shares
-        portfolio_values[symbol] = {'initial_value': initial_value, 'current_value': current_value}
+        return has_price_data and has_trading_data
+
+    def get_current_price(self) -> float:
+        """
+        Get the current price estimate from available data.
+        Returns the mid-point of bid-ask if available, otherwise 0.
+        """
+        if self.bid > 0 and self.ask > 0:
+            return (self.bid + self.ask) / 2
+        if self.day_range[1] > self.day_range[0]:
+            return sum(self.day_range) / 2
+        return 0.0
+        
+class StockRecommendation:
+    """Stock recommendation system with weighted analysis of multiple factors."""
     
-    portfolio_returns = pd.DataFrame(portfolio_returns)
-    portfolio_returns = portfolio_returns.dropna()
+    # Classification thresholds
+    MARKET_CAP_THRESHOLDS = {
+        "MICRO": 3e8,    # $300M
+        "SMALL": 2e9,    # $2B
+        "MID": 1e10,     # $10B
+        "LARGE": 1e11    # $100B
+    }
     
-    total_return = (1 + portfolio_returns).prod() - 1
-    annualized_return = (1 + total_return) ** (252 / len(portfolio_returns)) - 1
-    volatility = portfolio_returns.std() * np.sqrt(252)
+    PE_THRESHOLDS = {
+        "LOW": 15,
+        "MODERATE": 25,
+        "HIGH": 35
+    }
     
-    # Calculate portfolio value metrics
-    total_initial_value = sum(info['initial_value'] for info in portfolio_values.values())
-    total_current_value = sum(info['current_value'] for info in portfolio_values.values())
-    total_return_value = (total_current_value - total_initial_value) / total_initial_value
-    
-    return total_return, annualized_return, volatility, total_return_value, total_initial_value, total_current_value
+    def __init__(self):
+        """Initialize the recommendation system with scoring weights."""
+        self.weights = {
+            "valuation": 0.3,
+            "momentum": 0.2,
+            "risk": 0.2,
+            "income": 0.15,
+            "growth": 0.15
+        }
+        self.logger = logging.getLogger(__name__)
+
+    def _analyze_valuation(self, metrics: StockMetrics) -> Dict[str, float]:
+        """Analyze valuation metrics."""
+        score = 0.0
+        confidence = 1.0
+        
+        if metrics.pe_ratio:
+            if metrics.pe_ratio < self.PE_THRESHOLDS["LOW"]:
+                score += 1.0
+            elif metrics.pe_ratio > self.PE_THRESHOLDS["HIGH"]:
+                score -= 1.0
+        else:
+            confidence *= 0.8
+            
+        if metrics.forward_pe:
+            if metrics.forward_pe < metrics.pe_ratio:
+                score += 0.5
+            elif metrics.forward_pe > metrics.pe_ratio:
+                score -= 0.5
+        else:
+            confidence *= 0.8
+            
+        return {"score": score, "confidence": confidence}
+
+    def _analyze_momentum(self, metrics: StockMetrics) -> Dict[str, float]:
+        """Analyze price momentum."""
+        score = 0.0
+        current_price = (metrics.bid + metrics.ask) / 2
+        
+        # Compare to 52-week range
+        week_range_midpoint = sum(metrics.week_range) / 2
+        if current_price > week_range_midpoint:
+            score += 0.5
+        else:
+            score -= 0.5
+            
+        # Compare to day range
+        day_range_midpoint = sum(metrics.day_range) / 2
+        if current_price > day_range_midpoint:
+            score += 0.5
+        else:
+            score -= 0.5
+            
+        return {"score": score, "confidence": 1.0}
+
+    def _analyze_risk(self, metrics: StockMetrics) -> Dict[str, float]:
+        """Analyze risk metrics."""
+        score = 0.0
+        
+        # Beta analysis
+        if metrics.beta < 0.8:
+            score += 1.0
+        elif metrics.beta > 1.2:
+            score -= 1.0
+            
+        # Market cap analysis
+        if metrics.market_cap > self.MARKET_CAP_THRESHOLDS["LARGE"]:
+            score += 0.5
+        elif metrics.market_cap < self.MARKET_CAP_THRESHOLDS["MICRO"]:
+            score -= 0.5
+            
+        return {"score": score, "confidence": 1.0}
+
+    def _analyze_income(self, metrics: StockMetrics) -> Dict[str, float]:
+        """Analyze income-related metrics."""
+        score = 0.0
+        confidence = 1.0
+        
+        if metrics.dividend_yield:
+            if metrics.dividend_yield > 0.04:  # 4% yield
+                score += 1.0
+            elif metrics.dividend_yield > 0.02:  # 2% yield
+                score += 0.5
+        else:
+            confidence *= 0.7
+            
+        if metrics.eps and metrics.eps > 0:
+            score += 0.5
+        elif metrics.eps and metrics.eps < 0:
+            score -= 1.0
+            
+        return {"score": score, "confidence": confidence}
+
+    def _analyze_growth(self, metrics: StockMetrics) -> Dict[str, float]:
+        """Analyze growth potential."""
+        score = 0.0
+        confidence = 1.0
+        
+        if metrics.target_est:
+            current_price = (metrics.bid + metrics.ask) / 2
+            potential_return = (metrics.target_est - current_price) / current_price
+            
+            if potential_return > 0.2:  # 20% upside
+                score += 1.0
+            elif potential_return < -0.1:  # 10% downside
+                score -= 1.0
+        else:
+            confidence *= 0.6
+            
+        return {"score": score, "confidence": confidence}
+
+    def get_recommendation(self, metrics: StockMetrics) -> Tuple[str, float, Dict]:
+        """
+        Generate a stock recommendation based on comprehensive analysis.
+        
+        Args:
+            metrics: StockMetrics object containing all relevant metrics
+            
+        Returns:
+            Tuple containing:
+            - recommendation: str ("Strong Buy", "Buy", "Hold", "Sell", "Strong Sell")
+            - confidence: float (0-1)
+            - analysis: Dict with detailed scoring breakdown
+        """
+        try:
+            analyses = {
+                "valuation": self._analyze_valuation(metrics),
+                "momentum": self._analyze_momentum(metrics),
+                "risk": self._analyze_risk(metrics),
+                "income": self._analyze_income(metrics),
+                "growth": self._analyze_growth(metrics)
+            }
+            
+            # Calculate weighted score
+            total_score = 0
+            total_confidence = 0
+            
+            for category, weight in self.weights.items():
+                analysis = analyses[category]
+                total_score += analysis["score"] * weight * analysis["confidence"]
+                total_confidence += weight * analysis["confidence"]
+            
+            # Normalize confidence
+            final_confidence = total_confidence / sum(self.weights.values())
+            
+            # Determine recommendation
+            if total_score > 0.5:
+                recommendation = "Strong Buy"
+            elif total_score > 0.2:
+                recommendation = "Buy"
+            elif total_score < -0.5:
+                recommendation = "Strong Sell"
+            elif total_score < -0.2:
+                recommendation = "Sell"
+            else:
+                recommendation = "Hold"
+                
+            return recommendation, final_confidence, analyses
+            
+        except Exception as e:
+            self.logger.error(f"Error generating recommendation: {str(e)}")
+            raise
+
+def get_recommendation(data, prophet_pred):
+    """Generate recommendation based on Prophet predictions"""
+    try:
+        last_price = data['Close'].iloc[-1]
+        future_price = prophet_pred['yhat'].iloc[-1]
+        price_change = ((future_price - last_price) / last_price) * 100
+        
+        if price_change > 10:
+            return "Strong Buy"
+        elif price_change > 5:
+            return "Buy"
+        elif price_change < -10:
+            return "Strong Sell"
+        elif price_change < -5:
+            return "Sell"
+        else:
+            return "Hold"
+    except Exception as e:
+        logging.error(f"Error generating recommendation: {str(e)}")
+        return "Unable to generate recommendation"
 
 # Main layout
 set_custom_theme()
@@ -427,26 +693,10 @@ with st.sidebar:
     
     indicators = st.multiselect(
         "Choose indicators to plot:",
-        ['SMA_20', 'SMA_50', 'EMA_20', 'RSI', 'MACD', 'Bollinger Bands', 'Stochastic', 'ADX', 'OBV', 'VWAP', 'Parabolic SAR', 'Chaikin Money Flow'],
+                ['SMA_20', 'SMA_50', 'EMA_20', 'RSI', 'MACD', 'Bollinger Bands', 'Stochastic', 'ADX', 'OBV', 'VWAP', 'Parabolic SAR', 'Chaikin Money Flow'],
         default=['SMA_20', 'SMA_50', 'EMA_20']
     )
     advanced_analysis = st.button("Run Advanced Analysis")
-
-    # Portfolio Management
-    st.subheader("Portfolio Management")
-    portfolio = st.text_area("Add stocks to your portfolio (comma-separated symbols)", value="")
-    portfolio = [symbol.strip() for symbol in portfolio.split(",") if symbol.strip()]
-    
-    portfolio_info = {}
-    for symbol in portfolio:
-        col1, col2 = st.columns(2)
-        with col1:
-            avg_price = st.number_input(f"Average Price for {symbol}", min_value=0.0, value=0.0, key=f"{symbol}_avg_price")
-        with col2:
-            num_shares = st.number_input(f"Number of Shares for {symbol}", min_value=0, value=0, key=f"{symbol}_num_shares")
-        portfolio_info[symbol] = {'avg_price': avg_price, 'num_shares': num_shares}
-    
-    analyze_portfolio = st.button("Analyze Portfolio")
 
 # Main content
 if stock_symbol:
@@ -492,6 +742,51 @@ if stock_symbol:
             st.write(f"**Dividend & Yield:** {realtime_data['dividendYield']}")
             st.write(f"**Ex-Dividend Date:** {realtime_data['exDividendDate']}")
             st.write(f"**1y Target Est:** ₹{realtime_data['targetEstimate']}")
+        
+        # Get recommendation based on realtime data
+        try:
+            metrics = StockMetrics(
+                bid=realtime_data['bid'],
+                ask=realtime_data['ask'],
+                day_range=(
+                    float(realtime_data['dayRange'].split(' - ')[0]) if ' - ' in str(realtime_data['dayRange']) else 0.0,
+                    float(realtime_data['dayRange'].split(' - ')[1]) if ' - ' in str(realtime_data['dayRange']) else 0.0),
+                week_range=(
+                    float(realtime_data['weekRange'].split(' - ')[0]) if ' - ' in str(realtime_data['weekRange']) else 0.0,
+                    float(realtime_data['weekRange'].split(' - ')[1]) if ' - ' in str(realtime_data['weekRange']) else 0.0),
+                avg_volume=realtime_data['avgVolume'],
+                beta=realtime_data['beta'],
+                market_cap=realtime_data['marketCap'],
+                pe_ratio=realtime_data['peRatio'],
+                eps=realtime_data['eps'],
+                forward_pe=realtime_data['forwardPE'],
+                earnings_date=realtime_data['earningsDate'],
+                dividend_yield=realtime_data['dividendYield'],
+                ex_dividend_date=realtime_data['exDividendDate'],
+                target_est=realtime_data['targetEstimate']
+            )
+            
+            if metrics.is_valid_for_analysis():
+                recommender = StockRecommendation()
+                recommendation, confidence, analysis = recommender.get_recommendation(metrics)
+                
+                st.subheader("Recommendation")
+                st.write(f"Based on the current financial metrics, the recommendation for {stock_symbol} is: **{recommendation}**")
+                st.write(f"Confidence: {confidence:.2f}")
+                
+                # Display detailed analysis in collapsible sections
+                st.subheader("Detailed Analysis")
+                for category, result in analysis.items():
+                    with st.expander(f"{category.capitalize()} Analysis"):
+                        st.write(f"**Score:** {result['score']:.2f}")
+                        st.write(f"**Confidence:** {result['confidence']:.2f}")
+                        # Add more detailed explanations if needed
+            else:
+                st.warning("Insufficient data available for generating a reliable recommendation.")
+
+        except Exception as e:
+            st.error(f"Error generating recommendation: {str(e)}")
+            logging.error(f"Error in recommendation generation: {str(e)}", exc_info=True)
     
     if data.empty:
         st.error(f"No historical data available for {stock_symbol} between {start_date} and {end_date}. Please try a different date range or stock symbol.")
@@ -506,6 +801,13 @@ if stock_symbol:
         st.subheader("Advanced Analysis with Predictions")
         advanced_fig = plot_advanced_analysis(data, stock_symbol, indicators)
         st.plotly_chart(advanced_fig, use_container_width=True)
+        
+        # Get Prophet predictions
+        prophet_pred = prophet_prediction(data)
+        if prophet_pred is not None:
+            recommendation = get_recommendation(data, prophet_pred)
+            st.subheader("Recommendation")
+            st.write(f"Based on the Prophet model predictions, the recommendation for {stock_symbol} is: **{recommendation}**")
     
     st.subheader(f"{stock_symbol} News Sentiment Analysis")
     news_df, overall_sentiment = get_news_sentiment(stock_symbol)
@@ -525,30 +827,6 @@ if stock_symbol:
             st.markdown("---")
     else:
         st.warning(f"No recent news found for {stock_symbol}")
-
-# Portfolio Analysis
-if analyze_portfolio:
-    if not portfolio:
-        st.warning("Please add stocks to your portfolio.")
-    else:
-        portfolio_data = get_portfolio_data(portfolio, start_date, end_date)
-        if not portfolio_data:
-            st.warning("No data available for the stocks in your portfolio.")
-        else:
-            st.subheader("Portfolio Analysis")
-            total_return, annualized_return, volatility, total_return_value, total_initial_value, total_current_value = calculate_portfolio_performance(portfolio_data, portfolio_info)
-            st.write(f"**Total Return:** {total_return.mean():.2%}")
-            st.write(f"**Annualized Return:** {annualized_return.mean():.2%}")
-            st.write(f"**Volatility:** {volatility.mean():.2%}")
-            st.write(f"**Total Return Value:** {total_return_value:.2%}")
-            st.write(f"**Total Initial Value:** ₹{total_initial_value:,.2f}")
-            st.write(f"**Total Current Value:** ₹{total_current_value:,.2f}")
-            
-            composition_fig = plot_portfolio_composition(portfolio_data)
-            st.plotly_chart(composition_fig, use_container_width=True)
-            
-            performance_fig = plot_portfolio_performance(total_return, annualized_return, volatility, total_return_value, total_initial_value, total_current_value)
-            st.plotly_chart(performance_fig, use_container_width=True)
 
 else:
     st.info("Please search and select a stock to begin analysis.")
