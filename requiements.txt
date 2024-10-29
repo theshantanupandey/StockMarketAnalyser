@@ -1,8 +1,13 @@
 streamlit
+pandas
+numpy
 plotly
 yfinance
-GoogleNews
-textblob
-sklearn
+scikit-learn
 keras
 statsmodels
+ta
+google-news
+textblob
+prophet
+dataclasses
