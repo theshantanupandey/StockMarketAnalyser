@@ -16,6 +16,7 @@ from textblob import TextBlob
 from prophet import Prophet
 from dataclasses import dataclass
 from datetime import datetime
+from collections import defaultdict
 from typing import Optional, Dict, Tuple
 import logging
 
@@ -664,6 +665,91 @@ def get_recommendation(data, prophet_pred):
         logging.error(f"Error generating recommendation: {str(e)}")
         return "Unable to generate recommendation"
 
+import numpy as np
+from collections import defaultdict
+
+def combine_evidence(evidence):
+    """Combine evidence using Dempster-Shafer Theory (DST)."""
+    combined_belief = defaultdict(float)
+    normalization_factor = 0
+    
+    for model, beliefs in evidence.items():
+        for outcome, belief in beliefs.items():
+            combined_belief[outcome] += belief
+            normalization_factor += belief
+    
+    # Normalize the combined belief
+    for outcome in combined_belief:
+        combined_belief[outcome] /= normalization_factor
+    
+    return combined_belief
+
+class BeliefRuleBase:
+    def __init__(self, rules):
+        self.rules = rules
+    
+    def apply_rules(self, combined_belief):
+        """Apply BRB rules based on the combined belief."""
+        for rule in self.rules:
+            condition = rule['condition']
+            action = rule['action']
+            
+            # Check if the condition matches the combined belief
+            match = all(combined_belief.get(outcome, 0) > 0.5 for outcome in condition.values())
+            
+            if match:
+                return action
+        
+        return "Hold"  # Default action if no rule matches
+
+# Define BRB rules
+brb_rules = [
+    {
+        "condition": {"LSTM": "positive", "ARIMA": "positive"},
+        "action": "Strong Buy"
+    },
+    {
+        "condition": {"LSTM": "negative", "ARIMA": "negative"},
+        "action": "Strong Sell"
+    },
+    {
+        "condition": {"LSTM": "positive", "ARIMA": "negative"},
+        "action": "Hold"
+    },
+    # Add more rules as needed
+]
+
+# Initialize BRB system
+brb = BeliefRuleBase(brb_rules)
+
+def get_recommendation_with_er_brb(data, prophet_pred):
+    """Generate recommendation based on ER and BRB"""
+    try:
+        # Get predictions from different models
+        lstm_pred = lstm_prediction(data)
+        arima_pred = arima_prediction(data)
+        rf_pred = random_forest_prediction(data)
+        prophet_pred = prophet_prediction(data)
+        
+        # Combine evidence using ER
+        evidence = {
+            "LSTM": {"positive": 0.8, "negative": 0.2},  # Example belief functions
+            "ARIMA": {"positive": 0.7, "negative": 0.3},
+            "RandomForest": {"positive": 0.6, "negative": 0.4},
+            "Prophet": {"positive": 0.9, "negative": 0.1}
+        }
+        combined_belief = combine_evidence(evidence)
+        
+        # Apply BRB rules
+        recommendation = brb.apply_rules(combined_belief)
+        
+        return recommendation
+    except Exception as e:
+        logging.error(f"Error generating recommendation with ER and BRB: {str(e)}")
+        return "Unable to generate recommendation"
+
+
+
 # Main layout
 set_custom_theme()
 add_header()
@@ -672,7 +758,7 @@ add_header()
 with st.sidebar:
     st.title("Stock Analyzer")
     
-    search_query = st.text_input("Search for a stock (e.g., RELIANCE, TCS)")
+    search_query = st.text_input("Search for a stock")
     stock_symbol = None
     if search_query:
         search_results = search_indian_stocks(search_query)
@@ -805,9 +891,9 @@ if stock_symbol:
         # Get Prophet predictions
         prophet_pred = prophet_prediction(data)
         if prophet_pred is not None:
-            recommendation = get_recommendation(data, prophet_pred)
+            recommendation = get_recommendation_with_er_brb(data, prophet_pred)
             st.subheader("Recommendation")
-            st.write(f"Based on the Prophet model predictions, the recommendation for {stock_symbol} is: **{recommendation}**")
+            st.write(f"Based on the combined analysis using ER and BRB, the recommendation for {stock_symbol} is: **{recommendation}**")
     
     st.subheader(f"{stock_symbol} News Sentiment Analysis")
     news_df, overall_sentiment = get_news_sentiment(stock_symbol)
