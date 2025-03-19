@@ -4,6 +4,7 @@ plotly
 pandas
 numpy
 plotly
+sklearn
 yfinance
 scikit-learn
 keras
